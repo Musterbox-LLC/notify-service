@@ -1,6 +1,6 @@
 module notify-service
 
-go 1.25.1
+go 1.25.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.40.0
