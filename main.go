@@ -74,7 +74,7 @@ func main() {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS,PATCH,HEAD",
-		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Requested-With,X-Device-ID,X-User-ID,X-User-Roles,X-Service-Token,X-Otp-Not-Required",
+		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Requested-With,X-Device-ID,X-User-ID,X-User-Roles,X-Service-Token,X-Otp-Not-Required,Cache-Control",
 		ExposeHeaders:    "X-Access-Token,X-Refresh-Token,X-New-Refresh-Token,X-Otp-Not-Required,Content-Type", // Added Content-Type
 		AllowCredentials: true,
 		MaxAge:           86400,
