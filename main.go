@@ -113,7 +113,7 @@ func main() {
 	log.Println("✅ [ROUTES] Registered admin routes: /admin/*")
 
 	// Add OPTIONS handler for SSE endpoint (important for CORS preflight)
-	app.Get("/svc/v1/sse/notifications", func(c *fiber.Ctx) error {
+	app.Options("/svc/v1/sse/notifications", func(c *fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusOK)
 	})
 
