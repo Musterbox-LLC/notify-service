@@ -69,14 +69,14 @@ func main() {
 	app.Use(recover.New())
 
 	allowedOrigins := getEnv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
-	
-	// FIX: Add AllowCredentials: true for CORS
+
+	// CORS configuration:
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS,PATCH,HEAD",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Requested-With,X-Device-ID,X-User-ID,X-User-Roles,X-Service-Token,X-Otp-Not-Required",
-		ExposeHeaders:    "X-Access-Token,X-Refresh-Token,X-New-Refresh-Token,X-Otp-Not-Required",
-		AllowCredentials: true, // THIS IS CRITICAL FOR SSE
+		ExposeHeaders:    "X-Access-Token,X-Refresh-Token,X-New-Refresh-Token,X-Otp-Not-Required,Content-Type", // Added Content-Type
+		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
 
