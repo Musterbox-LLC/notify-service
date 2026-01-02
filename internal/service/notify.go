@@ -8,6 +8,7 @@ import (
 	"notify-service/internal/email"
 	"notify-service/internal/email/templates"
 	"notify-service/internal/notification"
+	"notify-service/internal/sse" // Add SSE package import
 	"notify-service/internal/sync"
 	"notify-service/pkg/models"
 	"notify-service/utils"
@@ -25,6 +26,7 @@ type NotifyService struct {
 	db              *gorm.DB
 	r2Client        *utils.NotificationR2Client
 	userSyncService *sync.UserSyncService
+	sseBroker       *sse.Broker // Add SSE broker
 }
 
 func NewNotifyService(emailSender *email.Sender, r2Client *utils.NotificationR2Client, userSyncService *sync.UserSyncService) *NotifyService {
@@ -33,11 +35,18 @@ func NewNotifyService(emailSender *email.Sender, r2Client *utils.NotificationR2C
 		db:              notification.GetDB(),
 		r2Client:        r2Client,
 		userSyncService: userSyncService,
+		sseBroker:       sse.NewBroker(), // Initialize SSE broker
 	}
 }
 
+// GetDB returns the database instance
 func (s *NotifyService) GetDB() *gorm.DB {
 	return s.db
+}
+
+// GetSSEBroker returns the SSE broker instance
+func (s *NotifyService) GetSSEBroker() *sse.Broker {
+	return s.sseBroker
 }
 
 // --- User Sync & Helpers ---
@@ -237,16 +246,16 @@ func (s *NotifyService) SendEmail(ctx context.Context, req *models.EmailRequest)
 		}
 
 		d := templates.ConversionSolToFiatData{
-			UserName:      getString(data["user_name"]),
-			SOLAmount:     getString(data["sol_amount"]),
-			FiatAmount:    getString(data["fiat_amount"]),
-			FiatCurrency:  getString(data["fiat_currency"]),
-			FeeAmountSOL:  getString(data["fee_amount_sol"]),
-			ExchangeRate:  getString(data["exchange_rate"]),
-			TxID:          getString(data["txid"]),
-			Timestamp:     getString(data["timestamp"]),
-			LogoURL:       getString(data["logo_url"]),
-			Year:          getYear(data["year"]),
+			UserName:     getString(data["user_name"]),
+			SOLAmount:    getString(data["sol_amount"]),
+			FiatAmount:   getString(data["fiat_amount"]),
+			FiatCurrency: getString(data["fiat_currency"]),
+			FeeAmountSOL: getString(data["fee_amount_sol"]),
+			ExchangeRate: getString(data["exchange_rate"]),
+			TxID:         getString(data["txid"]),
+			Timestamp:    getString(data["timestamp"]),
+			LogoURL:      getString(data["logo_url"]),
+			Year:         getYear(data["year"]),
 		}
 
 		log.Printf("📧 [DEBUG] conversion_sol_to_fiat_completed: extracted data - UserName: '%s', %s SOL → %s %s, Fee: %s SOL, Rate: %s, TxID: '%s', Time: '%s'",
@@ -271,16 +280,16 @@ func (s *NotifyService) SendEmail(ctx context.Context, req *models.EmailRequest)
 		}
 
 		d := templates.ConversionFiatToSolData{
-			UserName:       getString(data["user_name"]),
-			FiatAmount:     getString(data["fiat_amount"]),
-			FiatCurrency:   getString(data["fiat_currency"]),
-			SOLAmount:      getString(data["sol_amount"]),
-			FeeAmountFiat:  getString(data["fee_amount_fiat"]),
-			ExchangeRate:   getString(data["exchange_rate"]),
-			TxID:           getString(data["txid"]),
-			Timestamp:      getString(data["timestamp"]),
-			LogoURL:        getString(data["logo_url"]),
-			Year:           getYear(data["year"]),
+			UserName:      getString(data["user_name"]),
+			FiatAmount:    getString(data["fiat_amount"]),
+			FiatCurrency:  getString(data["fiat_currency"]),
+			SOLAmount:     getString(data["sol_amount"]),
+			FeeAmountFiat: getString(data["fee_amount_fiat"]),
+			ExchangeRate:  getString(data["exchange_rate"]),
+			TxID:          getString(data["txid"]),
+			Timestamp:     getString(data["timestamp"]),
+			LogoURL:       getString(data["logo_url"]),
+			Year:          getYear(data["year"]),
 		}
 
 		log.Printf("📧 [DEBUG] conversion_fiat_to_sol_completed: extracted data - UserName: '%s', %s %s → %s SOL, Fee: %s %s, Rate: %s, TxID: '%s', Time: '%s'",
@@ -380,9 +389,25 @@ func (s *NotifyService) SendEmail(ctx context.Context, req *models.EmailRequest)
 			log.Printf("⚠️ Failed to save recipient for email notification %s: %v", notif.ID, err)
 		} else {
 			log.Printf("✅ Email notification & recipient created: %s → user %s", notif.ID, req.UserID)
+
+			// 🔥 BROADCAST TO SSE FOR REAL-TIME UPDATES
+			s.broadcastNotificationToSSE(req.UserID, notif)
 		}
 	}()
 	return nil
+}
+
+// Helper to broadcast notification to SSE clients
+func (s *NotifyService) broadcastNotificationToSSE(userID uuid.UUID, notification *models.Notification) {
+	if s.sseBroker != nil {
+		event := sse.Event{
+			Type:   "notification.created",
+			Data:   notification,
+			UserID: userID,
+		}
+		s.sseBroker.Broadcast(event)
+		log.Printf("📡 [SSE] Broadcast notification %s to user %s", notification.ID, userID)
+	}
 }
 
 func getNotificationHeading(emailType string) string {
@@ -638,6 +663,12 @@ func (s *NotifyService) PublishNotification(ctx context.Context, id uuid.UUID, t
 			}).Error; err != nil {
 			return fmt.Errorf("failed to update template: %w", err)
 		}
+
+		// 🔥 BROADCAST TO SSE FOR EACH USER
+		for _, userID := range targetUserIDs {
+			s.broadcastNotificationToSSE(userID, &template)
+		}
+
 		log.Printf("✅ Published notification %s to %d users", id, len(targetUserIDs))
 		return nil
 	})
@@ -873,6 +904,10 @@ func (s *NotifyService) CreateAndDeliverSystemNotification(
 	}
 
 	log.Printf("✅ System notification %s delivered to user %s", notification.ID, userID)
+
+	// 🔥 BROADCAST TO SSE FOR REAL-TIME UPDATES
+	s.broadcastNotificationToSSE(userID, notification)
+
 	return notification, nil
 }
 

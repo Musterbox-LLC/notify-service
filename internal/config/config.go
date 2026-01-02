@@ -30,6 +30,7 @@ type Config struct {
 
 	// Auth
 	ServiceExpectedToken string
+	AuthServiceURL       string // URL of the auth service for SSE validation
 
 	// R2 Storage
 	R2AccountID       string
@@ -78,6 +79,7 @@ func Load() *Config {
 		DBSSLMode:  getEnv("DB_SSLMODE", "disable"),
 
 		ServiceExpectedToken: getEnv("SERVICE_TOKEN", "your-secret-service-token"),
+		AuthServiceURL:       getEnv("AUTH_SERVICE_URL", "http://auth-service:8080"), // Add this line
 
 		// R2 Configuration
 		R2AccountID:       os.Getenv("R2_ACCOUNT_ID"),

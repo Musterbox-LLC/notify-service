@@ -126,3 +126,18 @@ type SystemNotificationTemplate struct {
     CreatedAt    time.Time      `json:"created_at"`
     UpdatedAt    time.Time      `json:"updated_at"`
 }
+
+type NotificationEvent struct {
+	Event      string         `json:"event"`      // e.g., "created", "read", "delivered"
+	At         time.Time      `json:"at"`
+	UserID     uuid.UUID      `json:"user_id"`    // recipient user
+	DeviceID   *string        `json:"device_id,omitempty"`
+	Notification *Notification `json:"notification"`
+	Delivery   *DeliveryInfo  `json:"delivery,omitempty"` // optional per-recipient state
+}
+
+type DeliveryInfo struct {
+	Status      NotificationRecipientStatus `json:"status"`
+	DeliveredAt *time.Time                  `json:"delivered_at,omitempty"`
+	ReadAt      *time.Time                  `json:"read_at,omitempty"`
+}

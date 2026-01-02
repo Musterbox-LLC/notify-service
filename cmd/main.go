@@ -11,6 +11,7 @@ import (
 
 	"notify-service/internal/config"
 	"notify-service/internal/email"
+	"notify-service/internal/middleware"
 	"notify-service/internal/notification"
 	"notify-service/internal/service"
 	"notify-service/internal/sync"
@@ -29,7 +30,6 @@ func main() {
 	startTime = time.Now()
 	cfg := config.Load()
 	log.Printf("🔧 Service expected token: %s******", cfg.ServiceExpectedToken[:6])
-
 	notification.InitDB(cfg)
 
 	r2Config := utils.NotificationR2Config{
@@ -53,6 +53,14 @@ func main() {
 	handler := http.NewHandler(notifyService)
 	log.Println("✅ [SERVICE] NotifyService & Handler initialized")
 
+	authServiceURL := os.Getenv("AUTH_SERVICE_URL")
+	msServiceToken := os.Getenv("MS_SERVICE_TOKEN")
+	if authServiceURL == "" || msServiceToken == "" {
+		log.Fatal("❌ AUTH_SERVICE_URL and MS_SERVICE_TOKEN are required for SSE auth (e.g., /svc/v1/sse/notifications)")
+	}
+	authClient := service.NewAuthServiceClient(authServiceURL, msServiceToken)
+	log.Printf("✅ Auth service client initialized for SSE: %s", authServiceURL)
+
 	app := fiber.New(fiber.Config{
 		AppName:      "notify-service",
 		ErrorHandler: customErrorHandler,
@@ -61,11 +69,14 @@ func main() {
 	app.Use(recover.New())
 
 	allowedOrigins := getEnv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
+	
+	// FIX: Add AllowCredentials: true for CORS
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS,PATCH,HEAD",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Requested-With,X-Device-ID,X-User-ID,X-User-Roles,X-Service-Token,X-Otp-Not-Required",
 		ExposeHeaders:    "X-Access-Token,X-Refresh-Token,X-New-Refresh-Token,X-Otp-Not-Required",
+		AllowCredentials: true, // THIS IS CRITICAL FOR SSE
 		MaxAge:           86400,
 	}))
 
@@ -87,7 +98,7 @@ func main() {
 	gatewayAdminRoutes.Get("/users", notifHandler.GetAllUsers)
 	gatewayAdminRoutes.Get("/notifications", notifHandler.GetAllNotificationsAdmin)
 	gatewayAdminRoutes.Post("/notifications", notifHandler.CreateNotification)
-	gatewayAdminRoutes.Post("/upload", notifHandler.UploadNotificationFiles) // ❗ Requires UploadNotificationFiles — not in pasted text; will flag later
+	gatewayAdminRoutes.Post("/upload", notifHandler.UploadNotificationFiles)
 	gatewayAdminRoutes.Put("/notifications/:id", notifHandler.UpdateNotification)
 	gatewayAdminRoutes.Delete("/notifications/:id", notifHandler.DeleteNotification)
 	gatewayAdminRoutes.Post("/notifications/:id/publish", notifHandler.PublishNotification)
@@ -97,16 +108,25 @@ func main() {
 	gatewayAdminRoutes.Post("/notifications/bulk", notifHandler.BulkDeliverNotification)
 	gatewayAdminRoutes.Get("/notifications/:id/receipts", notifHandler.GetNotificationReceipts)
 	gatewayAdminRoutes.Get("/system-templates/", notifHandler.GetSystemTemplates)
-	gatewayAdminRoutes.Patch("/system-templates/:event_key", notifHandler.UpdateSystemTemplate) 
+	gatewayAdminRoutes.Patch("/system-templates/:event_key", notifHandler.UpdateSystemTemplate)
 
 	log.Println("✅ [ROUTES] Registered admin routes: /admin/*")
+
+	// Add OPTIONS handler for SSE endpoint (important for CORS preflight)
+	app.Options("/svc/v1/sse/notifications", func(c *fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	// 3b. SSE routes with auth middleware
+	sseRoutes := app.Group("/svc/v1/sse", middleware.SSEAuthMiddleware(authClient))
+	sseRoutes.Get("/notifications", notifHandler.StreamNotifications)
+	log.Println("✅ [ROUTES] Registered SSE route: /svc/v1/sse/notifications")
 
 	// 3. Service-to-service routes
 	serviceRoutes := app.Group("/svc/v1", serviceAuth(cfg))
 	serviceRoutes.Post("/notify/email", handler.SendEmail)
-	serviceRoutes.Post("/notifications/trigger", notifHandler.TriggerSystemNotification) 
+	serviceRoutes.Post("/notifications/trigger", notifHandler.TriggerSystemNotification)
 	serviceRoutes.Post("/notifications", notifHandler.CreateNotification)
-	// Removed deprecated route
 	log.Println("✅ [ROUTES] Registered service routes: /svc/v1/notify/email, /notifications")
 
 	// 4. Sync routes
@@ -148,6 +168,7 @@ func main() {
 			"uptime":      uptime.String(),
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 			"profile_url": cfg.ProfileServiceURL,
+			"sse_clients": notifyService.GetSSEBroker().GetTotalClientCount(),
 		})
 	})
 	log.Println("✅ [ROUTES] Registered /health")
@@ -166,6 +187,7 @@ func main() {
 	log.Printf("🚀 notify-service starting...")
 	log.Printf("   🔗 Listening on port: %s", cfg.ServerPort)
 	log.Printf("   🌐 CORS allowed origins: %s", allowedOrigins)
+	log.Printf("   🌐 CORS with credentials: ENABLED")
 	log.Printf("   📦 R2 bucket: %s", cfg.R2BucketName)
 	log.Printf("   🔄 Profile sync URL: %s", cfg.ProfileServiceURL)
 	log.Printf("   🛡️  Service token prefix: %s******", cfg.ServiceExpectedToken[:6])
