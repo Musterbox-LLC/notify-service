@@ -616,6 +616,7 @@ func (h *NotificationHandler) GetSystemTemplates(c *fiber.Ctx) error {
 }
 
 
+
 func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
     // ------------------------------------------------------------
     // 1. Retrieve authenticated context (set by SSEAuthMiddleware)
@@ -637,47 +638,34 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
     log.Printf("✅ [SSE] 🟢 Connection STARTED for user=%s, device=%s at %s", userID, deviceID, connStart.Format(time.RFC3339Nano))
 
     // ------------------------------------------------------------
-    // 2. CRITICAL: Set SSE headers BEFORE SetBodyStreamWriter
+    // 2. Set SSE headers IMMEDIATELY and correctly
     // ------------------------------------------------------------
     c.Set("Content-Type", "text/event-stream")
     c.Set("Cache-Control", "no-cache")
     c.Set("Connection", "keep-alive")
     c.Set("X-Accel-Buffering", "no")
-    c.Set("Transfer-Encoding", "chunked")
     
-    // IMPORTANT: Set CORS headers
-    origin := c.Get("Origin")
-    if origin != "" {
-        c.Set("Access-Control-Allow-Origin", origin)
-        c.Set("Access-Control-Allow-Credentials", "true")
-    }
+    // IMPORTANT: Also set these headers for CORS
+    c.Set("Access-Control-Allow-Origin", "*")
+    c.Set("Access-Control-Allow-Credentials", "true")
 
     // ------------------------------------------------------------
-    // 3. Register SSE client BEFORE streaming
+    // 3. Use Fiber's SSE support or write directly
     // ------------------------------------------------------------
-    broker := h.notifyService.GetSSEBroker()
-    clientChan := make(chan sse.Event, 10)
-    broker.Register(userID, clientChan)
-    
-    // Defer cleanup
-    defer func() {
-        broker.Unregister(userID, clientChan)
-        close(clientChan)
-        duration := time.Since(connStart)
-        log.Printf("🔌 [SSE] 🔴 Connection CLOSED for user=%s after %v", userID, duration)
-    }()
-
-    // ------------------------------------------------------------
-    // 4. Use Fiber's SetBodyStreamWriter with proper implementation
-    // ------------------------------------------------------------
-	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-		flusher, ok := any(w).(interface{ Flush() error })
-		if !ok {
-			log.Printf("⚠️ [SSE] Writer doesn't support Flush() for user=%s", userID)
-			return
-		}
-
-        log.Printf("📡 [SSE] Starting stream writer for user=%s", userID)
+    c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+        writer := w
+        
+        // ------------------------------------------------------------
+        // 4. Register SSE client
+        // ------------------------------------------------------------
+        broker := h.notifyService.GetSSEBroker()
+        clientChan := make(chan sse.Event, 10)
+        broker.Register(userID, clientChan)
+        defer func() {
+            broker.Unregister(userID, clientChan)
+            duration := time.Since(connStart)
+            log.Printf("🔌 [SSE] 🔴 Connection CLOSED for user=%s after %v", userID, duration)
+        }()
 
         // ------------------------------------------------------------
         // 5. Initial snapshot
@@ -692,46 +680,30 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
             for i := len(initial) - 1; i >= 0; i-- {
                 n := initial[i]
                 
-                // Format SSE message properly
-                message := fmt.Sprintf("event: notification.created\ndata: %s\n\n", toJSON(n))
-                
-                // Write and flush
-                if _, err := w.Write([]byte(message)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write initial notification %s: %v", n.ID, err)
+                fmt.Fprintf(writer,
+                    "event: notification.created\ndata: %s\n\n",
+                    toJSON(n),
+                )
+                if err := writer.Flush(); err != nil {
+                    log.Printf("⚠️ [SSE] Failed to flush initial notification %s", n.ID)
                     return
                 }
-                
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush initial notification %s: %v", n.ID, err)
-                    return
-                }
-                
-                // Small delay to prevent overwhelming client
-                time.Sleep(10 * time.Millisecond)
             }
         }
 
         // ------------------------------------------------------------
         // 6. Send 'ready' event
         // ------------------------------------------------------------
-        readyPayload := map[string]interface{}{
-            "status":  "ready",
-            "at":      time.Now().Format(time.RFC3339Nano),
+        readyPayload := map[string]string{
+            "status": "ready", 
+            "at": time.Now().Format(time.RFC3339Nano),
             "message": "SSE connection established successfully",
-            "user_id": userID.String(),
         }
-        readyJSON, _ := json.Marshal(readyPayload)
-        readyMessage := fmt.Sprintf("event: ready\ndata: %s\n\n", readyJSON)
-        
+        readyJSON := toJSON(readyPayload)
         log.Printf("✅ [SSE] → user=%s | event=ready", userID)
-        
-        if _, err := w.Write([]byte(readyMessage)); err != nil {
-            log.Printf("⚠️ [SSE] Failed to write ready event: %v", err)
-            return
-        }
-        
-        if err := flusher.Flush(); err != nil {
-            log.Printf("⚠️ [SSE] Failed to flush ready event: %v", err)
+
+        fmt.Fprintf(writer, "event: ready\ndata: %s\n\n", readyJSON)
+        if err := writer.Flush(); err != nil {
             return
         }
 
@@ -739,7 +711,7 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
         // 7. Stream loop with proper error handling
         // ------------------------------------------------------------
         done := c.Context().Done()
-        heartbeat := time.NewTicker(30 * time.Second)
+        heartbeat := time.NewTicker(30 * time.Second) // Increased to 30 seconds
         defer heartbeat.Stop()
 
         for {
@@ -753,27 +725,22 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
                     continue
                 }
                 
-                eventJSON, err := json.Marshal(event.Data)
-                if err != nil {
-                    log.Printf("⚠️ [SSE] Failed to marshal event data: %v", err)
-                    continue
-                }
+                eventJSON := toJSON(event.Data)
                 
-                // Format SSE message
-                message := fmt.Sprintf("event: %s\ndata: %s\n\n", event.Type, eventJSON)
-                
-                // Log for debugging
-                log.Printf("📡 [SSE] → user=%s | event=%s | data_length=%d", 
-                    userID, event.Type, len(eventJSON))
+                // Log the event for debugging
+                log.Printf("📡 [SSE] → user=%s | event=%s", userID, event.Type)
 
-                // Write event
-                if _, err := w.Write([]byte(message)); err != nil {
+                _, err := fmt.Fprintf(writer,
+                    "event: %s\ndata: %s\n\n",
+                    event.Type,
+                    eventJSON,
+                )
+                if err != nil {
                     log.Printf("⚠️ [SSE] Write error for user=%s: %v", userID, err)
                     return
                 }
                 
-                // Flush immediately
-                if err := flusher.Flush(); err != nil {
+                if err := writer.Flush(); err != nil {
                     log.Printf("⚠️ [SSE] Flush error for user=%s: %v", userID, err)
                     return
                 }
@@ -781,15 +748,12 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
             case <-heartbeat.C:
                 log.Printf("💓 [SSE] → user=%s | sending heartbeat", userID)
                 
-                // Send heartbeat as comment (not an event)
-                heartbeatMsg := ": heartbeat\n\n"
-                if _, err := w.Write([]byte(heartbeatMsg)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write heartbeat: %v", err)
+                // Send proper SSE comment for heartbeat
+                if _, err := writer.WriteString(": heartbeat\n\n"); err != nil {
                     return
                 }
                 
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush heartbeat: %v", err)
+                if err := writer.Flush(); err != nil {
                     return
                 }
             }
