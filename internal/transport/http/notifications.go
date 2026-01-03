@@ -385,8 +385,6 @@ func (h *NotificationHandler) GetAll(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"notifications": notifications})
 }
 
-
-
 func (h *NotificationHandler) MarkRead(c *fiber.Ctx) error {
 	userIDStr := c.Params("user_id")
 	userID, err := uuid.Parse(userIDStr)
@@ -624,36 +622,42 @@ func renderTemplateString(template string, variables map[string]interface{}) str
 	return result
 }
 
-
 // ✅ GetSystemTemplates — admin only
 func (h *NotificationHandler) GetSystemTemplates(c *fiber.Ctx) error {
-    db := h.notifyService.GetDB()
-    var templates []models.SystemNotificationTemplate
-    // Fetch all templates, ordered by event_key for consistency
-    if err := db.Order("event_key ASC").Find(&templates).Error; err != nil {
-        log.Printf("❌ GetSystemTemplates: %v", err)
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch templates"})
-    }
-    // Return the list of templates
-    return c.JSON(fiber.Map{"templates": templates})
+	db := h.notifyService.GetDB()
+	var templates []models.SystemNotificationTemplate
+	// Fetch all templates, ordered by event_key for consistency
+	if err := db.Order("event_key ASC").Find(&templates).Error; err != nil {
+		log.Printf("❌ GetSystemTemplates: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch templates"})
+	}
+	// Return the list of templates
+	return c.JSON(fiber.Map{"templates": templates})
 }
-
 
 // StreamNotifications is removed as SSE is replaced by FCM
 func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
-    return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
-        "error": "SSE streaming is deprecated. Use FCM push notifications instead.",
-    })
+	return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
+		"error": "SSE streaming is deprecated. Use FCM push notifications instead.",
+	})
 }
 
 func (h *NotificationHandler) RegisterFCMToken(c *fiber.Ctx) error {
-	userIDStr := c.Get("X-User-ID") // or from params/body
+	userIDStr := c.Params("user_id") // Get from route parameter
 	if userIDStr == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "X-User-ID required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id parameter required"})
 	}
+	
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user ID"})
+	}
+	
+	// Optional: Verify route param matches header for security
+	headerUserID := c.Get("X-User-ID")
+	if headerUserID != "" && userIDStr != headerUserID {
+		log.Printf("⚠️ User ID mismatch: route=%s, header=%s", userIDStr, headerUserID)
+		// Still proceed, but log the mismatch
 	}
 
 	var req struct {
@@ -692,15 +696,16 @@ func (h *NotificationHandler) RegisterFCMToken(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"status": "success",
+		"status":   "success",
 		"token_id": token.ID,
 	})
 }
 
 func (h *NotificationHandler) UnregisterFCMToken(c *fiber.Ctx) error {
-	userID, err := uuid.Parse(c.Get("X-User-ID"))
+	userIDStr := c.Params("user_id") // Get from route parameter
+	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "X-User-ID invalid"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
 	}
 
 	var req struct {
@@ -718,7 +723,6 @@ func (h *NotificationHandler) UnregisterFCMToken(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{"status": "success"})
 }
-
 
 func (h *NotificationHandler) GetAllSince(c *fiber.Ctx) error {
 	userID := c.Params("user_id")
@@ -760,106 +764,104 @@ func (h *NotificationHandler) GetAllSince(c *fiber.Ctx) error {
 	return c.JSON(notifications)
 }
 
-
-
 // DeleteNotification - User deletes their notification
 func (h *NotificationHandler) DeleteNotificationForUser(c *fiber.Ctx) error {
-    userIDStr := c.Params("user_id")
-    notificationIDStr := c.Params("notification_id")
-    
-    userID, err := uuid.Parse(userIDStr)
-    if err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
-    }
-    
-    notificationID, err := uuid.Parse(notificationIDStr)
-    if err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid notification_id"})
-    }
-    
-    // Soft delete the notification recipient record
-    err = h.notifyService.GetDB().Where("user_id = ? AND notification_id = ?", userID, notificationID).
-        Delete(&models.NotificationRecipient{}).Error
-    
-    if err != nil {
-        log.Printf("❌ DeleteNotificationForUser failed: %v", err)
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete notification"})
-    }
-    
-    return c.JSON(fiber.Map{
-        "status": "success",
-        "message": "notification deleted",
-    })
+	userIDStr := c.Params("user_id")
+	notificationIDStr := c.Params("notification_id")
+	
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
+	}
+	
+	notificationID, err := uuid.Parse(notificationIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid notification_id"})
+	}
+	
+	// Soft delete the notification recipient record
+	err = h.notifyService.GetDB().Where("user_id = ? AND notification_id = ?", userID, notificationID).
+		Delete(&models.NotificationRecipient{}).Error
+	
+	if err != nil {
+		log.Printf("❌ DeleteNotificationForUser failed: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete notification"})
+	}
+	
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "notification deleted",
+	})
 }
 
 // ClearAllNotifications - User clears all their notifications
 func (h *NotificationHandler) ClearAllNotifications(c *fiber.Ctx) error {
-    userIDStr := c.Params("user_id")
-    
-    userID, err := uuid.Parse(userIDStr)
-    if err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
-    }
-    
-    var req struct {
-        NotificationIDs []uuid.UUID `json:"notification_ids"`
-    }
-    
-    if err := c.BodyParser(&req); err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
-    }
-    
-    // If specific IDs provided, delete only those
-    if len(req.NotificationIDs) > 0 {
-        err = h.notifyService.GetDB().
-            Where("user_id = ? AND notification_id IN ?", userID, req.NotificationIDs).
-            Delete(&models.NotificationRecipient{}).Error
-    } else {
-        // Delete all notifications for user
-        err = h.notifyService.GetDB().
-            Where("user_id = ?", userID).
-            Delete(&models.NotificationRecipient{}).Error
-    }
-    
-    if err != nil {
-        log.Printf("❌ ClearAllNotifications failed: %v", err)
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to clear notifications"})
-    }
-    
-    return c.JSON(fiber.Map{
-        "status": "success",
-        "message": "notifications cleared",
-        "count": len(req.NotificationIDs),
-    })
+	userIDStr := c.Params("user_id")
+	
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
+	}
+	
+	var req struct {
+		NotificationIDs []uuid.UUID `json:"notification_ids"`
+	}
+	
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	
+	// If specific IDs provided, delete only those
+	if len(req.NotificationIDs) > 0 {
+		err = h.notifyService.GetDB().
+			Where("user_id = ? AND notification_id IN ?", userID, req.NotificationIDs).
+			Delete(&models.NotificationRecipient{}).Error
+	} else {
+		// Delete all notifications for user
+		err = h.notifyService.GetDB().
+			Where("user_id = ?", userID).
+			Delete(&models.NotificationRecipient{}).Error
+	}
+	
+	if err != nil {
+		log.Printf("❌ ClearAllNotifications failed: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to clear notifications"})
+	}
+	
+	return c.JSON(fiber.Map{
+		"status":  "success",
+		"message": "notifications cleared",
+		"count":   len(req.NotificationIDs),
+	})
 }
 
 // HasUnreadNotifications - Minimal endpoint that returns true/false
 func (h *NotificationHandler) HasUnreadNotifications(c *fiber.Ctx) error {
-    userIDStr := c.Params("user_id")
-    userID, err := uuid.Parse(userIDStr)
-    if err != nil {
-        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
-    }
+	userIDStr := c.Params("user_id")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
+	}
 
-    var hasUnread bool
-    // Simple EXISTS query - very efficient
-    err = h.notifyService.GetDB().Raw(`
-        SELECT EXISTS(
-            SELECT 1 
-            FROM notification_recipients 
-            WHERE user_id = ? 
-            AND status = 'delivered'
-            LIMIT 1
-        )`, userID).Scan(&hasUnread).Error
-    
-    if err != nil {
-        log.Printf("❌ HasUnreadNotifications failed: %v", err)
-        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check"})
-    }
+	var hasUnread bool
+	// Simple EXISTS query - very efficient
+	err = h.notifyService.GetDB().Raw(`
+		SELECT EXISTS(
+			SELECT 1 
+			FROM notification_recipients 
+			WHERE user_id = ? 
+			AND status = 'delivered'
+			LIMIT 1
+		)`, userID).Scan(&hasUnread).Error
+	
+	if err != nil {
+		log.Printf("❌ HasUnreadNotifications failed: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check"})
+	}
 
-    // Return minimal binary response
-    return c.JSON(fiber.Map{
-        "has_unread": hasUnread,
-        "ts": time.Now().UTC().Unix(),
-    })
+	// Return minimal binary response
+	return c.JSON(fiber.Map{
+		"has_unread": hasUnread,
+		"ts":         time.Now().UTC().Unix(),
+	})
 }

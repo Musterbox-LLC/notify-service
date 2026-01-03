@@ -77,8 +77,6 @@ func main() {
 		log.Println("⚠️ AUTH_SERVICE_URL and MS_SERVICE_TOKEN are missing. SSE auth was previously required, but SSE is now removed.")
 		// No longer fatal if SSE is removed
 	}
-	// authClient := service.NewAuthServiceClient(authServiceURL, msServiceToken)
-	// log.Printf("✅ Auth service client initialized for SSE: %s", authServiceURL) // This line would be removed if authClient is removed
 
 	app := fiber.New(fiber.Config{
 		AppName:      "notify-service",
@@ -136,11 +134,6 @@ func main() {
 	gatewayAdminRoutes.Patch("/system-templates/:event_key", notifHandler.UpdateSystemTemplate)
 
 	log.Println("✅ [ROUTES] Registered admin routes: /admin/*")
-
-	// 3b. SSE routes with auth middleware - REMOVED
-	// sseRoutes := app.Group("/svc/v1/sse", middleware.SSEAuthMiddleware(authClient))
-	// sseRoutes.Get("/notifications", notifHandler.StreamNotifications)
-	// log.Println("✅ [ROUTES] Registered SSE route: /svc/v1/sse/notifications")
 
 	// 3. Service-to-service routes
 	serviceRoutes := app.Group("/svc/v1", serviceAuth(cfg))
