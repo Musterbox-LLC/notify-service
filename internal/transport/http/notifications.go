@@ -733,54 +733,107 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
         }
 
         // ------------------------------------------------------------
-        // 7. Initial snapshot with timeout
+        // 7. Initial snapshot with timeout - fetch ALL notifications
         // ------------------------------------------------------------
-        initialCtx, initialCancel := context.WithTimeout(streamCtx, 5*time.Second) // 5s timeout
+        initialCtx, initialCancel := context.WithTimeout(streamCtx, 10*time.Second) // Increased timeout for large datasets
         defer initialCancel()
 
-        log.Printf("📥 [SSE] Fetching initial notifications for user=%s", userID)
-        initial, err := h.notifyService.GetAllNotifications(initialCtx, userID, 50, 0)
-        if err != nil {
-            if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-                log.Printf("⏭️ [SSE] Initial fetch timed out or cancelled for user=%s", userID)
-                // Continue — don’t abort stream on timeout
-            } else {
-                log.Printf("⚠️ [SSE] Failed to fetch initial notifications for %s: %v", userID, err)
-                // Continue — don’t abort stream on DB error
+        log.Printf("📥 [SSE] Fetching ALL notifications for user=%s", userID)
+        
+        // Fetch all notifications (no limit) - adjust offset pagination as needed
+        allNotifications := make([]*models.Notification, 0)
+        offset := 0
+        limit := 100 // Fetch in batches to avoid memory issues
+        
+        for {
+            // Check if context was cancelled during pagination
+            select {
+            case <-initialCtx.Done():
+                log.Printf("⏭️ [SSE] Initial fetch context cancelled for user=%s", userID)
+                goto sendNotifications
+            default:
             }
-        } else {
-            log.Printf("📥 [SSE] Retrieved %d initial notifications for user=%s", len(initial), userID)
-
-            // Send notifications in chronological order (oldest to newest)
-            for i := len(initial) - 1; i >= 0; i-- {
-                n := initial[i]
-
-                // Guard: skip if stream context cancelled mid-loop
-                select {
-                case <-streamCtx.Done():
-                    log.Printf("⏭️ [SSE] Initial send interrupted for user=%s", userID)
-                    return
-                default:
+            
+            batch, err := h.notifyService.GetAllNotifications(initialCtx, userID, limit, offset)
+            if err != nil {
+                if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+                    log.Printf("⏭️ [SSE] Initial fetch timed out or cancelled for user=%s", userID)
+                    break
+                } else {
+                    log.Printf("⚠️ [SSE] Failed to fetch notifications batch for user=%s: %v", userID, err)
+                    // Continue with partial data
+                    break
                 }
+            }
+            
+            // Add batch to all notifications
+            allNotifications = append(allNotifications, batch...)
+            
+            // If batch size is less than limit, we've reached the end
+            if len(batch) < limit {
+                break
+            }
+            
+            offset += limit
+        }
 
-                // Format SSE message properly
-                message := fmt.Sprintf("event: notification.created\ndata: %s\n\n", toJSON(n))
+    sendNotifications:
+        log.Printf("📥 [SSE] Retrieved %d total notifications for user=%s", len(allNotifications), userID)
+
+        // Send all notifications as a single event
+        if len(allNotifications) > 0 {
+            // Format as a special "initial_data" event containing all notifications
+            initialDataPayload := map[string]interface{}{
+                "type": "initial_data",
+                "notifications": allNotifications,
+                "count": len(allNotifications),
+                "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+            }
+            
+            initialDataJSON, err := json.Marshal(initialDataPayload)
+            if err != nil {
+                log.Printf("⚠️ [SSE] Failed to marshal initial data for user=%s: %v", userID, err)
+            } else {
+                initialDataMessage := fmt.Sprintf("event: notification.initial\ndata: %s\n\n", string(initialDataJSON))
                 
-                // Write and flush
-                if _, err := w.Write([]byte(message)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write initial notification %s for user=%s: %v", n.ID, userID, err)
+                if _, err := w.Write([]byte(initialDataMessage)); err != nil {
+                    log.Printf("⚠️ [SSE] Failed to write initial data for user=%s: %v", userID, err)
                     return
                 }
                 
                 if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush initial notification %s for user=%s: %v", n.ID, userID, err)
+                    log.Printf("⚠️ [SSE] Failed to flush initial data for user=%s: %v", userID, err)
                     return
                 }
                 
-                log.Printf("📥 [SSE] Sent initial notification %s to user=%s", n.ID, userID)
+                log.Printf("📥 [SSE] Sent all %d notifications to user=%s as initial data", len(allNotifications), userID)
+            }
+        } else {
+            // Send empty initial data if no notifications exist
+            initialDataPayload := map[string]interface{}{
+                "type": "initial_data",
+                "notifications": []interface{}{},
+                "count": 0,
+                "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+            }
+            
+            initialDataJSON, err := json.Marshal(initialDataPayload)
+            if err != nil {
+                log.Printf("⚠️ [SSE] Failed to marshal empty initial data for user=%s: %v", userID, err)
+            } else {
+                initialDataMessage := fmt.Sprintf("event: notification.initial\ndata: %s\n\n", string(initialDataJSON))
                 
-                // Small delay to prevent overwhelming client
-                time.Sleep(10 * time.Millisecond)
+                if _, err := w.Write([]byte(initialDataMessage)); err != nil {
+                    log.Printf("⚠️ [SSE] Failed to write empty initial data for user=%s: %v", userID, err)
+                    return
+                }
+                
+                if err := flusher.Flush(); err != nil {
+                    log.Printf("⚠️ [SSE] Failed to flush empty initial data for user=%s: %v", userID, err)
+                    return
+                }
+                
+                log.Printf("📥 [SSE] Sent empty initial data to user=%s", userID)
             }
         }
 
