@@ -623,11 +623,13 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
     // ------------------------------------------------------------
     userIDStr, ok := middleware.GetUserIDFromContext(c)
     if !ok {
+        log.Printf("❌ [SSE] User ID not found in context for path: %s", c.Path())
         return c.Status(fiber.StatusInternalServerError).
             JSON(fiber.Map{"error": "User ID not found in context"})
     }
     userID, err := uuid.Parse(userIDStr)
     if err != nil {
+        log.Printf("❌ [SSE] Invalid user ID in context: %s, error: %v", userIDStr, err)
         return c.Status(fiber.StatusInternalServerError).
             JSON(fiber.Map{"error": "Invalid user ID in context"})
     }
@@ -662,15 +664,17 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
     
     // Defer cleanup
     defer func() {
+        log.Printf("🔌 [SSE] Initiating cleanup for user=%s", userID)
         broker.Unregister(userID, clientChan)
         // Safely close the channel only once
         func() {
             defer func() {
                 if recover() != nil {
-                    // Channel was already closed
+                    log.Printf("⚠️ [SSE] Channel already closed for user=%s", userID)
                 }
             }()
             close(clientChan)
+            log.Printf("🔒 [SSE] Channel closed for user=%s", userID)
         }()
         duration := time.Since(connStart)
         log.Printf("🔌 [SSE] 🔴 Connection CLOSED for user=%s after %v", userID, duration)
@@ -687,6 +691,7 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
     // Cancel streaming context when request context ends (e.g., client disconnects)
     go func() {
         <-reqCtx.Done()
+        log.Printf("🔒 [SSE] Request context done for user=%s, cancelling stream", userID)
         cancel()
     }()
     defer cancel() // safe idempotent call
@@ -718,28 +723,33 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
         log.Printf("✅ [SSE] → user=%s | event=ready", userID)
         
         if _, err := w.Write([]byte(readyMessage)); err != nil {
-            log.Printf("⚠️ [SSE] Failed to write ready event: %v", err)
+            log.Printf("⚠️ [SSE] Failed to write ready event for user=%s: %v", userID, err)
             return
         }
         
         if err := flusher.Flush(); err != nil {
-            log.Printf("⚠️ [SSE] Failed to flush ready event: %v", err)
+            log.Printf("⚠️ [SSE] Failed to flush ready event for user=%s: %v", userID, err)
             return
         }
 
         // ------------------------------------------------------------
-        // 7. Initial snapshot (after ready event)
+        // 7. Initial snapshot with timeout
         // ------------------------------------------------------------
-        initial, err := h.notifyService.GetAllNotifications(streamCtx, userID, 50, 0)
+        initialCtx, initialCancel := context.WithTimeout(streamCtx, 5*time.Second) // 5s timeout
+        defer initialCancel()
+
+        log.Printf("📥 [SSE] Fetching initial notifications for user=%s", userID)
+        initial, err := h.notifyService.GetAllNotifications(initialCtx, userID, 50, 0)
         if err != nil {
             if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-                log.Printf("⏭️ [SSE] Initial fetch cancelled for user=%s", userID)
-                return
+                log.Printf("⏭️ [SSE] Initial fetch timed out or cancelled for user=%s", userID)
+                // Continue — don’t abort stream on timeout
+            } else {
+                log.Printf("⚠️ [SSE] Failed to fetch initial notifications for %s: %v", userID, err)
+                // Continue — don’t abort stream on DB error
             }
-            log.Printf("⚠️ [SSE] Failed to fetch initial notifications for %s: %v", userID, err)
-            // Continue — don’t abort stream on DB error
         } else {
-            log.Printf("📥 [SSE] Sending %d initial notifications for user=%s", len(initial), userID)
+            log.Printf("📥 [SSE] Retrieved %d initial notifications for user=%s", len(initial), userID)
 
             // Send notifications in chronological order (oldest to newest)
             for i := len(initial) - 1; i >= 0; i-- {
@@ -758,14 +768,16 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
                 
                 // Write and flush
                 if _, err := w.Write([]byte(message)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write initial notification %s: %v", n.ID, err)
+                    log.Printf("⚠️ [SSE] Failed to write initial notification %s for user=%s: %v", n.ID, userID, err)
                     return
                 }
                 
                 if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush initial notification %s: %v", n.ID, err)
+                    log.Printf("⚠️ [SSE] Failed to flush initial notification %s for user=%s: %v", n.ID, userID, err)
                     return
                 }
+                
+                log.Printf("📥 [SSE] Sent initial notification %s to user=%s", n.ID, userID)
                 
                 // Small delay to prevent overwhelming client
                 time.Sleep(10 * time.Millisecond)
@@ -775,6 +787,7 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
         // ------------------------------------------------------------
         // 8. Stream loop — use streamCtx.Done() ✅
         // ------------------------------------------------------------
+        log.Printf("📡 [SSE] Entering stream loop for user=%s", userID)
         heartbeat := time.NewTicker(30 * time.Second)
         defer heartbeat.Stop()
 
@@ -786,12 +799,13 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
 
             case event := <-clientChan:
                 if event.Data == nil {
+                    log.Printf("⚠️ [SSE] Received nil event data for user=%s", userID)
                     continue
                 }
                 
                 eventJSON, err := json.Marshal(event.Data)
                 if err != nil {
-                    log.Printf("⚠️ [SSE] Failed to marshal event data: %v", err)
+                    log.Printf("⚠️ [SSE] Failed to marshal event data for user=%s: %v", userID, err)
                     continue
                 }
                 
@@ -815,11 +829,11 @@ func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
                 
                 // Send heartbeat comment (keeps connection alive, ignored by EventSource)
                 if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
-                    log.Printf("⚠️ [SSE] Heartbeat write failed: %v", err)
+                    log.Printf("⚠️ [SSE] Heartbeat write failed for user=%s: %v", userID, err)
                     return
                 }
                 if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Heartbeat flush failed: %v", err)
+                    log.Printf("⚠️ [SSE] Heartbeat flush failed for user=%s: %v", userID, err)
                     return
                 }
             }
