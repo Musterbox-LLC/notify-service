@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -11,7 +12,7 @@ import (
 
 	"notify-service/internal/config"
 	"notify-service/internal/email"
-	"notify-service/internal/middleware"
+	"notify-service/internal/fcm"
 	"notify-service/internal/notification"
 	"notify-service/internal/service"
 	"notify-service/internal/sync"
@@ -49,17 +50,35 @@ func main() {
 	log.Printf("🔄 [SYNC] User sync service initialized (ProfileServiceURL: %s)", cfg.ProfileServiceURL)
 
 	emailSender := email.NewSender(cfg)
-	notifyService := service.NewNotifyService(emailSender, r2Client, userSyncService)
+
+	// Initialize FCM client
+	var fcmClient *fcm.FCMClient
+	fcmCredsJSON := os.Getenv("FIREBASE_CREDENTIALS_JSON")
+	if fcmCredsJSON != "" {
+		client, err := fcm.NewFCMClient(context.Background(), []byte(fcmCredsJSON))
+		if err != nil {
+			log.Fatalf("❌ Failed to initialize FCM: %v", err)
+		}
+		fcmClient = client
+		log.Println("✅ FCM client initialized")
+	} else {
+		log.Println("⚠️ FCM disabled (no FIREBASE_CREDENTIALS_JSON)")
+	}
+
+	notifyService := service.NewNotifyService(emailSender, r2Client, userSyncService, fcmClient)
 	handler := http.NewHandler(notifyService)
 	log.Println("✅ [SERVICE] NotifyService & Handler initialized")
 
+	// NOTE: AuthServiceURL and MS_SERVICE_TOKEN are still loaded from config/env
+	// but the authClient for SSE is no longer initialized or used.
 	authServiceURL := os.Getenv("AUTH_SERVICE_URL")
 	msServiceToken := os.Getenv("MS_SERVICE_TOKEN")
 	if authServiceURL == "" || msServiceToken == "" {
-		log.Fatal("❌ AUTH_SERVICE_URL and MS_SERVICE_TOKEN are required for SSE auth (e.g., /svc/v1/sse/notifications)")
+		log.Println("⚠️ AUTH_SERVICE_URL and MS_SERVICE_TOKEN are missing. SSE auth was previously required, but SSE is now removed.")
+		// No longer fatal if SSE is removed
 	}
-	authClient := service.NewAuthServiceClient(authServiceURL, msServiceToken)
-	log.Printf("✅ Auth service client initialized for SSE: %s", authServiceURL)
+	// authClient := service.NewAuthServiceClient(authServiceURL, msServiceToken)
+	// log.Printf("✅ Auth service client initialized for SSE: %s", authServiceURL) // This line would be removed if authClient is removed
 
 	app := fiber.New(fiber.Config{
 		AppName:      "notify-service",
@@ -88,9 +107,15 @@ func main() {
 	gatewayUserRoutes := app.Group("/v1/notify/s", gatewayAuth())
 	notifHandler := handler.GetNotificationHandler()
 	gatewayUserRoutes.Get("/user/:user_id", notifHandler.GetAll)
+	gatewayUserRoutes.Get("/user/:user_id/since", notifHandler.GetAllSince)
 	gatewayUserRoutes.Get("/user/:user_id/unread", notifHandler.GetUnread)
 	gatewayUserRoutes.Post("/user/:user_id/mark-read", notifHandler.MarkRead)
 	gatewayUserRoutes.Post("/user/:user_id/mark-all-read", notifHandler.MarkAllRead)
+	gatewayUserRoutes.Get("/user/:user_id/has-unread", notifHandler.HasUnreadNotifications)
+	gatewayUserRoutes.Delete("/user/:user_id/notifications/:notification_id", notifHandler.DeleteNotificationForUser)
+	gatewayUserRoutes.Post("/user/:user_id/clear-all", notifHandler.ClearAllNotifications)
+	gatewayUserRoutes.Post("/user/:user_id/fcm-token", notifHandler.RegisterFCMToken)     // Add FCM token registration
+	gatewayUserRoutes.Delete("/user/:user_id/fcm-token", notifHandler.UnregisterFCMToken) // Add FCM token unregistration
 	log.Println("✅ [ROUTES] Registered user routes: /v1/notify/s/user/:user_id*")
 
 	// 2. Admin routes (via Gateway + admin role)
@@ -112,15 +137,10 @@ func main() {
 
 	log.Println("✅ [ROUTES] Registered admin routes: /admin/*")
 
-	// Add OPTIONS handler for SSE endpoint (important for CORS preflight)
-	// app.Options("/svc/v1/sse/notifications", func(c *fiber.Ctx) error {
-	// 	return c.SendStatus(fiber.StatusOK)
-	// })
-
-	// 3b. SSE routes with auth middleware
-	sseRoutes := app.Group("/svc/v1/sse", middleware.SSEAuthMiddleware(authClient))
-	sseRoutes.Get("/notifications", notifHandler.StreamNotifications)
-	log.Println("✅ [ROUTES] Registered SSE route: /svc/v1/sse/notifications")
+	// 3b. SSE routes with auth middleware - REMOVED
+	// sseRoutes := app.Group("/svc/v1/sse", middleware.SSEAuthMiddleware(authClient))
+	// sseRoutes.Get("/notifications", notifHandler.StreamNotifications)
+	// log.Println("✅ [ROUTES] Registered SSE route: /svc/v1/sse/notifications")
 
 	// 3. Service-to-service routes
 	serviceRoutes := app.Group("/svc/v1", serviceAuth(cfg))
@@ -168,7 +188,7 @@ func main() {
 			"uptime":      uptime.String(),
 			"timestamp":   time.Now().UTC().Format(time.RFC3339),
 			"profile_url": cfg.ProfileServiceURL,
-			"sse_clients": notifyService.GetSSEBroker().GetTotalClientCount(),
+			"fcm_enabled": fcmClient != nil, // Show FCM status instead of SSE
 		})
 	})
 	log.Println("✅ [ROUTES] Registered /health")

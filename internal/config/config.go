@@ -30,7 +30,7 @@ type Config struct {
 
 	// Auth
 	ServiceExpectedToken string
-	AuthServiceURL       string // URL of the auth service for SSE validation
+	AuthServiceURL       string // URL of the auth service for SSE validation or internal use
 
 	// R2 Storage
 	R2AccountID       string

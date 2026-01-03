@@ -25,7 +25,7 @@ func InitDB(cfg *config.Config) {
 	}
 
 	// Auto-migrate (safe in dev; use migrations in prod)
-	err = db.AutoMigrate( &models.SyncConfig{}, &models.Notification{}, &models.NotificationRecipient{}, &models.User{}, &models.SystemNotificationTemplate{})
+	err = db.AutoMigrate( &models.SyncConfig{}, &models.Notification{}, &models.NotificationRecipient{}, &models.User{}, &models.SystemNotificationTemplate{}, &models.FCMToken{})
 	if err != nil {
 		log.Fatalf("❌ Failed to migrate: %v", err)
 	}

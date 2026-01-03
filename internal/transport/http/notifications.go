@@ -1,15 +1,11 @@
 package http
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"notify-service/internal/middleware"
 	"notify-service/internal/service"
-	"notify-service/internal/sse"
 	"notify-service/pkg/models"
 	"strconv"
 	"strings"
@@ -18,6 +14,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type NotificationHandler struct {
@@ -355,15 +352,40 @@ func (h *NotificationHandler) GetAll(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
 	}
+	
+	// Check for since parameter
+	since := c.Query("since")
+	var sinceTime *time.Time
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "invalid since parameter, must be RFC3339 format",
+			})
+		}
+		sinceTime = &t
+	}
+	
 	limit := getQueryInt(c, "limit", 20, 1, 100)
 	offset := getQueryInt(c, "offset", 0, 0, 10000)
-	notifications, err := h.notifyService.GetAllNotifications(c.Context(), userID, limit, offset)
+	
+	// Use the new GetNotificationsSince method or modify GetAllNotifications to accept since
+	var notifications []*models.Notification
+	if sinceTime != nil {
+		notifications, err = h.notifyService.GetNotificationsSince(c.Context(), userID, sinceTime)
+	} else {
+		notifications, err = h.notifyService.GetAllNotifications(c.Context(), userID, limit, offset, sinceTime)
+	}
+	
 	if err != nil {
 		log.Printf("❌ GetAll: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch notifications"})
 	}
+	
 	return c.JSON(fiber.Map{"notifications": notifications})
 }
+
+
 
 func (h *NotificationHandler) MarkRead(c *fiber.Ctx) error {
 	userIDStr := c.Params("user_id")
@@ -617,281 +639,227 @@ func (h *NotificationHandler) GetSystemTemplates(c *fiber.Ctx) error {
 }
 
 
+// StreamNotifications is removed as SSE is replaced by FCM
 func (h *NotificationHandler) StreamNotifications(c *fiber.Ctx) error {
-    // ------------------------------------------------------------
-    // 1. Retrieve authenticated context (set by SSEAuthMiddleware)
-    // ------------------------------------------------------------
-    userIDStr, ok := middleware.GetUserIDFromContext(c)
-    if !ok {
-        log.Printf("❌ [SSE] User ID not found in context for path: %s", c.Path())
-        return c.Status(fiber.StatusInternalServerError).
-            JSON(fiber.Map{"error": "User ID not found in context"})
-    }
+    return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
+        "error": "SSE streaming is deprecated. Use FCM push notifications instead.",
+    })
+}
+
+func (h *NotificationHandler) RegisterFCMToken(c *fiber.Ctx) error {
+	userIDStr := c.Get("X-User-ID") // or from params/body
+	if userIDStr == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "X-User-ID required"})
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user ID"})
+	}
+
+	var req struct {
+		Token    string `json:"token" validate:"required"`
+		DeviceID string `json:"device_id" validate:"required"`
+		Platform string `json:"platform"` // e.g., "android", "ios", "web"
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON"})
+	}
+
+	if req.Platform == "" {
+		req.Platform = "unknown"
+	}
+
+	// Upsert: update if (user_id + device_id) exists
+	token := models.FCMToken{
+		UserID:   userID,
+		DeviceID: req.DeviceID,
+		Token:    req.Token,
+		Platform: req.Platform,
+	}
+
+	result := h.notifyService.GetDB().Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}, {Name: "device_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"token":      req.Token,
+			"platform":   req.Platform,
+			"updated_at": time.Now(),
+		}),
+	}).Create(&token)
+
+	if result.Error != nil {
+		log.Printf("❌ Failed to register FCM token: %v", result.Error)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "registration failed"})
+	}
+
+	return c.JSON(fiber.Map{
+		"status": "success",
+		"token_id": token.ID,
+	})
+}
+
+func (h *NotificationHandler) UnregisterFCMToken(c *fiber.Ctx) error {
+	userID, err := uuid.Parse(c.Get("X-User-ID"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "X-User-ID invalid"})
+	}
+
+	var req struct {
+		DeviceID string `json:"device_id" validate:"required"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id required"})
+	}
+
+	err = h.notifyService.GetDB().Where("user_id = ? AND device_id = ?", userID, req.DeviceID).
+		Update("deleted_at", time.Now()).Error
+
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "unregister failed"})
+	}
+	return c.JSON(fiber.Map{"status": "success"})
+}
+
+
+func (h *NotificationHandler) GetAllSince(c *fiber.Ctx) error {
+	userID := c.Params("user_id")
+	since := c.Query("since")
+	
+	if userID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "user_id is required",
+		})
+	}
+	
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid user_id",
+		})
+	}
+	
+	var sinceTime *time.Time
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "invalid since parameter, must be RFC3339 format",
+			})
+		}
+		sinceTime = &t
+	}
+	
+	// Get notifications from service - use h.notifyService instead of h.service
+	notifications, err := h.notifyService.GetNotificationsSince(c.Context(), uid, sinceTime)
+	if err != nil {
+		log.Printf("❌ Failed to get notifications since %v: %v", sinceTime, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get notifications",
+		})
+	}
+	
+	return c.JSON(notifications)
+}
+
+
+
+// DeleteNotification - User deletes their notification
+func (h *NotificationHandler) DeleteNotificationForUser(c *fiber.Ctx) error {
+    userIDStr := c.Params("user_id")
+    notificationIDStr := c.Params("notification_id")
+    
     userID, err := uuid.Parse(userIDStr)
     if err != nil {
-        log.Printf("❌ [SSE] Invalid user ID in context: %s, error: %v", userIDStr, err)
-        return c.Status(fiber.StatusInternalServerError).
-            JSON(fiber.Map{"error": "Invalid user ID in context"})
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
     }
-    deviceID, _ := middleware.GetDeviceIDFromContext(c)
-
-    // 🕒 Capture connection start time
-    connStart := time.Now()
-    log.Printf("✅ [SSE] 🟢 Connection STARTED for user=%s, device=%s at %s", userID, deviceID, connStart.Format(time.RFC3339Nano))
-
-    // ------------------------------------------------------------
-    // 2. CRITICAL: Set SSE headers BEFORE SetBodyStreamWriter
-    // ------------------------------------------------------------
-    c.Set("Content-Type", "text/event-stream")
-    c.Set("Cache-Control", "no-cache")
-    c.Set("Connection", "keep-alive")
-    c.Set("X-Accel-Buffering", "no")
-    c.Set("Transfer-Encoding", "chunked")
     
-    // IMPORTANT: Set CORS headers
-    origin := c.Get("Origin")
-    if origin != "" {
-        c.Set("Access-Control-Allow-Origin", origin)
-        c.Set("Access-Control-Allow-Credentials", "true")
+    notificationID, err := uuid.Parse(notificationIDStr)
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid notification_id"})
     }
-
-    // ------------------------------------------------------------
-    // 3. Register SSE client BEFORE streaming
-    // ------------------------------------------------------------
-    broker := h.notifyService.GetSSEBroker()
-    clientChan := make(chan sse.Event, 10)
-    broker.Register(userID, clientChan)
     
-    // Defer cleanup
-    defer func() {
-        log.Printf("🔌 [SSE] Initiating cleanup for user=%s", userID)
-        broker.Unregister(userID, clientChan)
-        // Safely close the channel only once
-        func() {
-            defer func() {
-                if recover() != nil {
-                    log.Printf("⚠️ [SSE] Channel already closed for user=%s", userID)
-                }
-            }()
-            close(clientChan)
-            log.Printf("🔒 [SSE] Channel closed for user=%s", userID)
-        }()
-        duration := time.Since(connStart)
-        log.Printf("🔌 [SSE] 🔴 Connection CLOSED for user=%s after %v", userID, duration)
-    }()
-
-    // ------------------------------------------------------------
-    // 4. SAFETY: Create a dedicated context for streaming
-    //    - Tied to request lifetime
-    //    - Safe to use in goroutines
-    // ------------------------------------------------------------
-    reqCtx := c.Context()                     // valid *here*
-    streamCtx, cancel := context.WithCancel(context.Background())
-
-    // Cancel streaming context when request context ends (e.g., client disconnects)
-    go func() {
-        <-reqCtx.Done()
-        log.Printf("🔒 [SSE] Request context done for user=%s, cancelling stream", userID)
-        cancel()
-    }()
-    defer cancel() // safe idempotent call
-
-    // ------------------------------------------------------------
-    // 5. Use Fiber's SetBodyStreamWriter — now SAFE
-    // ------------------------------------------------------------
-    c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
-        flusher, ok := any(w).(interface{ Flush() error })
-        if !ok {
-            log.Printf("⚠️ [SSE] Writer doesn't support Flush() for user=%s", userID)
-            return
-        }
-
-        log.Printf("📡 [SSE] Starting stream writer for user=%s", userID)
-
-        // ------------------------------------------------------------
-        // 6. Send 'ready' event FIRST (always)
-        // ------------------------------------------------------------
-        readyPayload := map[string]interface{}{
-            "status":  "ready",
-            "at":      time.Now().UTC().Format(time.RFC3339Nano),
-            "message": "SSE connection established successfully",
-            "user_id": userID.String(),
-        }
-        readyJSON, _ := json.Marshal(readyPayload)
-        readyMessage := fmt.Sprintf("event: ready\ndata: %s\n\n", readyJSON)
-        
-        log.Printf("✅ [SSE] → user=%s | event=ready", userID)
-        
-        if _, err := w.Write([]byte(readyMessage)); err != nil {
-            log.Printf("⚠️ [SSE] Failed to write ready event for user=%s: %v", userID, err)
-            return
-        }
-        
-        if err := flusher.Flush(); err != nil {
-            log.Printf("⚠️ [SSE] Failed to flush ready event for user=%s: %v", userID, err)
-            return
-        }
-
-        // ------------------------------------------------------------
-        // 7. Initial snapshot with timeout - fetch ALL notifications
-        // ------------------------------------------------------------
-        initialCtx, initialCancel := context.WithTimeout(streamCtx, 10*time.Second) // Increased timeout for large datasets
-        defer initialCancel()
-
-        log.Printf("📥 [SSE] Fetching ALL notifications for user=%s", userID)
-        
-        // Fetch all notifications (no limit) - adjust offset pagination as needed
-        allNotifications := make([]*models.Notification, 0)
-        offset := 0
-        limit := 100 // Fetch in batches to avoid memory issues
-        
-        for {
-            // Check if context was cancelled during pagination
-            select {
-            case <-initialCtx.Done():
-                log.Printf("⏭️ [SSE] Initial fetch context cancelled for user=%s", userID)
-                goto sendNotifications
-            default:
-            }
-            
-            batch, err := h.notifyService.GetAllNotifications(initialCtx, userID, limit, offset)
-            if err != nil {
-                if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-                    log.Printf("⏭️ [SSE] Initial fetch timed out or cancelled for user=%s", userID)
-                    break
-                } else {
-                    log.Printf("⚠️ [SSE] Failed to fetch notifications batch for user=%s: %v", userID, err)
-                    // Continue with partial data
-                    break
-                }
-            }
-            
-            // Add batch to all notifications
-            allNotifications = append(allNotifications, batch...)
-            
-            // If batch size is less than limit, we've reached the end
-            if len(batch) < limit {
-                break
-            }
-            
-            offset += limit
-        }
-
-    sendNotifications:
-        log.Printf("📥 [SSE] Retrieved %d total notifications for user=%s", len(allNotifications), userID)
-
-        // Send all notifications as a single event
-        if len(allNotifications) > 0 {
-            // Format as a special "initial_data" event containing all notifications
-            initialDataPayload := map[string]interface{}{
-                "type": "initial_data",
-                "notifications": allNotifications,
-                "count": len(allNotifications),
-                "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-            }
-            
-            initialDataJSON, err := json.Marshal(initialDataPayload)
-            if err != nil {
-                log.Printf("⚠️ [SSE] Failed to marshal initial data for user=%s: %v", userID, err)
-            } else {
-                initialDataMessage := fmt.Sprintf("event: notification.initial\ndata: %s\n\n", string(initialDataJSON))
-                
-                if _, err := w.Write([]byte(initialDataMessage)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write initial data for user=%s: %v", userID, err)
-                    return
-                }
-                
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush initial data for user=%s: %v", userID, err)
-                    return
-                }
-                
-                log.Printf("📥 [SSE] Sent all %d notifications to user=%s as initial data", len(allNotifications), userID)
-            }
-        } else {
-            // Send empty initial data if no notifications exist
-            initialDataPayload := map[string]interface{}{
-                "type": "initial_data",
-                "notifications": []interface{}{},
-                "count": 0,
-                "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-            }
-            
-            initialDataJSON, err := json.Marshal(initialDataPayload)
-            if err != nil {
-                log.Printf("⚠️ [SSE] Failed to marshal empty initial data for user=%s: %v", userID, err)
-            } else {
-                initialDataMessage := fmt.Sprintf("event: notification.initial\ndata: %s\n\n", string(initialDataJSON))
-                
-                if _, err := w.Write([]byte(initialDataMessage)); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to write empty initial data for user=%s: %v", userID, err)
-                    return
-                }
-                
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Failed to flush empty initial data for user=%s: %v", userID, err)
-                    return
-                }
-                
-                log.Printf("📥 [SSE] Sent empty initial data to user=%s", userID)
-            }
-        }
-
-        // ------------------------------------------------------------
-        // 8. Stream loop — use streamCtx.Done() ✅
-        // ------------------------------------------------------------
-        log.Printf("📡 [SSE] Entering stream loop for user=%s", userID)
-        heartbeat := time.NewTicker(30 * time.Second)
-        defer heartbeat.Stop()
-
-        for {
-            select {
-            case <-streamCtx.Done(): // ✅ CORRECT — not c.Context().Done()
-                log.Printf("🔌 [SSE] Stream cancelled for user=%s (client close or timeout)", userID)
-                return
-
-            case event := <-clientChan:
-                if event.Data == nil {
-                    log.Printf("⚠️ [SSE] Received nil event data for user=%s", userID)
-                    continue
-                }
-                
-                eventJSON, err := json.Marshal(event.Data)
-                if err != nil {
-                    log.Printf("⚠️ [SSE] Failed to marshal event data for user=%s: %v", userID, err)
-                    continue
-                }
-                
-                // Log for debugging
-                log.Printf("📡 [SSE] → user=%s | event=%s | data_length=%d", 
-                    userID, event.Type, len(eventJSON))
-
-                // Format & send
-                message := fmt.Sprintf("event: %s\ndata: %s\n\n", event.Type, eventJSON)
-                if _, err := w.Write([]byte(message)); err != nil {
-                    log.Printf("⚠️ [SSE] Write error for user=%s: %v", userID, err)
-                    return
-                }
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Flush error for user=%s: %v", userID, err)
-                    return
-                }
-
-            case <-heartbeat.C:
-                log.Printf("💓 [SSE] → user=%s | sending heartbeat", userID)
-                
-                // Send heartbeat comment (keeps connection alive, ignored by EventSource)
-                if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
-                    log.Printf("⚠️ [SSE] Heartbeat write failed for user=%s: %v", userID, err)
-                    return
-                }
-                if err := flusher.Flush(); err != nil {
-                    log.Printf("⚠️ [SSE] Heartbeat flush failed for user=%s: %v", userID, err)
-                    return
-                }
-            }
-        }
+    // Soft delete the notification recipient record
+    err = h.notifyService.GetDB().Where("user_id = ? AND notification_id = ?", userID, notificationID).
+        Delete(&models.NotificationRecipient{}).Error
+    
+    if err != nil {
+        log.Printf("❌ DeleteNotificationForUser failed: %v", err)
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to delete notification"})
+    }
+    
+    return c.JSON(fiber.Map{
+        "status": "success",
+        "message": "notification deleted",
     })
+}
 
-    return nil
+// ClearAllNotifications - User clears all their notifications
+func (h *NotificationHandler) ClearAllNotifications(c *fiber.Ctx) error {
+    userIDStr := c.Params("user_id")
+    
+    userID, err := uuid.Parse(userIDStr)
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
+    }
+    
+    var req struct {
+        NotificationIDs []uuid.UUID `json:"notification_ids"`
+    }
+    
+    if err := c.BodyParser(&req); err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+    }
+    
+    // If specific IDs provided, delete only those
+    if len(req.NotificationIDs) > 0 {
+        err = h.notifyService.GetDB().
+            Where("user_id = ? AND notification_id IN ?", userID, req.NotificationIDs).
+            Delete(&models.NotificationRecipient{}).Error
+    } else {
+        // Delete all notifications for user
+        err = h.notifyService.GetDB().
+            Where("user_id = ?", userID).
+            Delete(&models.NotificationRecipient{}).Error
+    }
+    
+    if err != nil {
+        log.Printf("❌ ClearAllNotifications failed: %v", err)
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to clear notifications"})
+    }
+    
+    return c.JSON(fiber.Map{
+        "status": "success",
+        "message": "notifications cleared",
+        "count": len(req.NotificationIDs),
+    })
+}
+
+// HasUnreadNotifications - Minimal endpoint that returns true/false
+func (h *NotificationHandler) HasUnreadNotifications(c *fiber.Ctx) error {
+    userIDStr := c.Params("user_id")
+    userID, err := uuid.Parse(userIDStr)
+    if err != nil {
+        return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user_id"})
+    }
+
+    var hasUnread bool
+    // Simple EXISTS query - very efficient
+    err = h.notifyService.GetDB().Raw(`
+        SELECT EXISTS(
+            SELECT 1 
+            FROM notification_recipients 
+            WHERE user_id = ? 
+            AND status = 'delivered'
+            LIMIT 1
+        )`, userID).Scan(&hasUnread).Error
+    
+    if err != nil {
+        log.Printf("❌ HasUnreadNotifications failed: %v", err)
+        return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check"})
+    }
+
+    // Return minimal binary response
+    return c.JSON(fiber.Map{
+        "has_unread": hasUnread,
+        "ts": time.Now().UTC().Unix(),
+    })
 }

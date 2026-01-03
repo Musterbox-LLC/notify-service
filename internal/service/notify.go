@@ -7,8 +7,8 @@ import (
 	"log"
 	"notify-service/internal/email"
 	"notify-service/internal/email/templates"
+	"notify-service/internal/fcm"
 	"notify-service/internal/notification"
-	"notify-service/internal/sse" // Add SSE package import
 	"notify-service/internal/sync"
 	"notify-service/pkg/models"
 	"notify-service/utils"
@@ -26,27 +26,22 @@ type NotifyService struct {
 	db              *gorm.DB
 	r2Client        *utils.NotificationR2Client
 	userSyncService *sync.UserSyncService
-	sseBroker       *sse.Broker // Add SSE broker
+	fcmClient       *fcm.FCMClient
 }
 
-func NewNotifyService(emailSender *email.Sender, r2Client *utils.NotificationR2Client, userSyncService *sync.UserSyncService) *NotifyService {
+func NewNotifyService(emailSender *email.Sender, r2Client *utils.NotificationR2Client, userSyncService *sync.UserSyncService, fcmClient *fcm.FCMClient) *NotifyService {
 	return &NotifyService{
 		emailSender:     emailSender,
 		db:              notification.GetDB(),
 		r2Client:        r2Client,
 		userSyncService: userSyncService,
-		sseBroker:       sse.NewBroker(), // Initialize SSE broker
+		fcmClient:       fcmClient,
 	}
 }
 
 // GetDB returns the database instance
 func (s *NotifyService) GetDB() *gorm.DB {
 	return s.db
-}
-
-// GetSSEBroker returns the SSE broker instance
-func (s *NotifyService) GetSSEBroker() *sse.Broker {
-	return s.sseBroker
 }
 
 // --- User Sync & Helpers ---
@@ -390,23 +385,53 @@ func (s *NotifyService) SendEmail(ctx context.Context, req *models.EmailRequest)
 		} else {
 			log.Printf("✅ Email notification & recipient created: %s → user %s", notif.ID, req.UserID)
 
-			// 🔥 BROADCAST TO SSE FOR REAL-TIME UPDATES
-			s.broadcastNotificationToSSE(req.UserID, notif)
+			// 🔥 SEND PUSH VIA FCM
+			s.sendPushNotificationToUser(req.UserID, notif)
 		}
 	}()
 	return nil
 }
 
-// Helper to broadcast notification to SSE clients
-func (s *NotifyService) broadcastNotificationToSSE(userID uuid.UUID, notification *models.Notification) {
-	if s.sseBroker != nil {
-		event := sse.Event{
-			Type:   "notification.created",
-			Data:   notification,
-			UserID: userID,
-		}
-		s.sseBroker.Broadcast(event)
-		log.Printf("📡 [SSE] Broadcast notification %s to user %s", notification.ID, userID)
+func (s *NotifyService) sendPushNotificationToUser(userID uuid.UUID, notif *models.Notification) {
+	if s.fcmClient == nil {
+		log.Printf("⚠️ [FCM] Skip push: FCM client not configured")
+		return
+	}
+
+	// Fetch active FCM tokens for this user
+	var tokens []models.FCMToken
+	err := s.db.Where("user_id = ? AND deleted_at IS NULL", userID).
+		Select("token").
+		Find(&tokens).Error
+	if err != nil {
+		log.Printf("⚠️ [FCM] Failed to fetch tokens for user %s: %v", userID, err)
+		return
+	}
+	if len(tokens) == 0 {
+		log.Printf("ℹ️ [FCM] No active FCM tokens for user %s", userID)
+		return
+	}
+
+	tokenStrs := make([]string, len(tokens))
+	for i, t := range tokens {
+		tokenStrs[i] = t.Token
+	}
+
+	// Optional: include metadata in push data (e.g., notification_id)
+	data := map[string]interface{}{
+		"notification_id": notif.ID.String(),
+		"type":            string(notif.Type),
+		"click_action":    "OPEN_NOTIFICATION", // or deep link
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = s.fcmClient.SendToMultipleTokens(ctx, tokenStrs, notif.Title, notif.Message, data)
+	if err != nil {
+		log.Printf("❌ [FCM] Push failed for user %s: %v", userID, err)
+	} else {
+		log.Printf("✅ [FCM] Push sent to %d device(s) for user %s", len(tokenStrs), userID)
 	}
 }
 
@@ -485,16 +510,26 @@ func (s *NotifyService) GetUnreadNotifications(ctx context.Context, userID uuid.
 	return notifs, err
 }
 
-func (s *NotifyService) GetAllNotifications(ctx context.Context, userID uuid.UUID, limit, offset int) ([]*models.Notification, error) {
+// Update GetAllNotifications to accept since parameter
+func (s *NotifyService) GetAllNotifications(ctx context.Context, userID uuid.UUID, limit, offset int, since *time.Time) ([]*models.Notification, error) {
 	var notifs []*models.Notification
-	err := s.db.WithContext(ctx).
+
+	query := s.db.WithContext(ctx).
 		Table("notifications").
 		Joins("INNER JOIN notification_recipients nr ON notifications.id = nr.notification_id").
-		Where("nr.user_id = ?", userID).
+		Where("nr.user_id = ?", userID)
+
+	// Add timestamp filter if provided
+	if since != nil {
+		query = query.Where("nr.delivered_at > ?", *since)
+	}
+
+	err := query.
 		Order("nr.delivered_at DESC NULLS LAST, notifications.created_at DESC").
 		Limit(limit).
 		Offset(offset).
 		Find(&notifs).Error
+
 	return notifs, err
 }
 
@@ -658,15 +693,15 @@ func (s *NotifyService) PublishNotification(ctx context.Context, id uuid.UUID, t
 		if err := tx.Model(&template).
 			Where("id = ?", id).
 			Updates(map[string]interface{}{
-				"is_draft":     false,
+				"is_draft":     false, // Ensure this is set to false
 				"delivered_at": &now,
 			}).Error; err != nil {
 			return fmt.Errorf("failed to update template: %w", err)
 		}
 
-		// 🔥 BROADCAST TO SSE FOR EACH USER
+		// 🔥 SEND PUSH VIA FCM FOR EACH USER
 		for _, userID := range targetUserIDs {
-			s.broadcastNotificationToSSE(userID, &template)
+			s.sendPushNotificationToUser(userID, &template)
 		}
 
 		log.Printf("✅ Published notification %s to %d users", id, len(targetUserIDs))
@@ -905,8 +940,8 @@ func (s *NotifyService) CreateAndDeliverSystemNotification(
 
 	log.Printf("✅ System notification %s delivered to user %s", notification.ID, userID)
 
-	// 🔥 BROADCAST TO SSE FOR REAL-TIME UPDATES
-	s.broadcastNotificationToSSE(userID, notification)
+	// 🔥 SEND PUSH VIA FCM
+	s.sendPushNotificationToUser(userID, notification)
 
 	return notification, nil
 }
@@ -962,4 +997,29 @@ func (s *NotifyService) UnscheduleNotificationWithCleanup(ctx context.Context, i
 		}
 	}
 	return s.db.WithContext(ctx).Model(&existing).Updates(updates).Error
+}
+
+// GetNotificationsSince - Get notifications for a user since a specific timestamp
+func (s *NotifyService) GetNotificationsSince(ctx context.Context, userID uuid.UUID, since *time.Time) ([]*models.Notification, error) {
+	var notifs []*models.Notification
+
+	// Base query - join with recipients table
+	query := s.db.WithContext(ctx).
+		Table("notifications").
+		Select("notifications.*").
+		Joins("INNER JOIN notification_recipients nr ON notifications.id = nr.notification_id").
+		Where("nr.user_id = ?", userID)
+
+	// Add timestamp filter if provided
+	if since != nil {
+		query = query.Where("nr.delivered_at > ?", *since)
+	}
+
+	// Order by most recent first
+	err := query.Order("nr.delivered_at DESC").Find(&notifs).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return notifs, nil
 }

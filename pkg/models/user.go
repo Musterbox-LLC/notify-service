@@ -3,6 +3,8 @@ package models
 
 import (
 	"time"
+
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -22,4 +24,15 @@ type User struct {
 // TableName specifies the table name for User
 func (User) TableName() string {
 	return "users"
+}
+
+type FCMToken struct {
+	ID        uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	UserID    uuid.UUID `gorm:"type:uuid;index"`
+	DeviceID  string    `gorm:"index;not null"` // e.g., device UUID or push ID
+	Token     string    `gorm:"not null"`       // FCM registration token
+	Platform  string    `gorm:"type:varchar(20);default:'unknown'"` // e.g., "android", "ios", "web"
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt gorm.DeletedAt `gorm:"index"` // soft delete for revoked tokens
 }
