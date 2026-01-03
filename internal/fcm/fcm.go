@@ -56,39 +56,57 @@ func intPtr(i int) *int {
 }
 
 func (f *FCMClient) SendToToken(ctx context.Context, token string, title, body string, data map[string]interface{}) error {
-	stringData := convertDataToStringMap(data)
+    stringData := convertDataToStringMap(data)
+    
+    // Ensure click_action is in data for Android
+    if _, hasClickAction := stringData["click_action"]; !hasClickAction {
+        stringData["click_action"] = "OPEN_NOTIFICATION"
+    }
 
-	badge := intPtr(1) // ✅ *int
+    badge := intPtr(1)
 
-	message := &messaging.Message{
-		Token: token,
-		Notification: &messaging.Notification{
-			Title: title,
-			Body:  body,
-		},
-		Data: stringData, // ✅ map[string]string
-		APNS: &messaging.APNSConfig{
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{
-					Sound: "default",
-					Badge: badge, // ✅ *int
-				},
-			},
-		},
-		Android: &messaging.AndroidConfig{
-			Notification: &messaging.AndroidNotification{
-				Sound: "default",
-			},
-			Priority: "high",
-		},
-	}
+    message := &messaging.Message{
+        Token: token,
+        Notification: &messaging.Notification{
+            Title: title,
+            Body:  body,
+        },
+        Data: stringData,
+        APNS: &messaging.APNSConfig{
+            Payload: &messaging.APNSPayload{
+                Aps: &messaging.Aps{
+                    Sound: "default",
+                    Badge: badge,
+                },
+            },
+        },
+        Android: &messaging.AndroidConfig{
+            Notification: &messaging.AndroidNotification{
+                Sound: "default",
+                // Android uses click_action in data payload
+            },
+            Priority: "high",
+        },
+        Webpush: &messaging.WebpushConfig{
+            Notification: &messaging.WebpushNotification{
+                Icon: "https://your-app.com/icon.png",
+                Badge: "https://your-app.com/badge.png",
+                Actions: []*messaging.WebpushNotificationAction{
+                    {
+                        Action: "open",
+                        Title:  "View",
+                    },
+                },
+            },
+        },
+    }
 
-	resp, err := f.client.Send(ctx, message)
-	if err != nil {
-		return fmt.Errorf("FCM send failed: %w", err)
-	}
-	log.Printf("✅ FCM sent to %s → msg ID: %s", maskToken(token), resp)
-	return nil
+    resp, err := f.client.Send(ctx, message)
+    if err != nil {
+        return fmt.Errorf("FCM send failed: %w", err)
+    }
+    log.Printf("✅ FCM sent to %s → msg ID: %s", maskToken(token), resp)
+    return nil
 }
 
 func (f *FCMClient) SendToMultipleTokens(ctx context.Context, tokens []string, title, body string, data map[string]interface{}) error {
