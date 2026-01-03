@@ -48,16 +48,28 @@ func (b *Broker) Unregister(userID uuid.UUID, clientChan chan Event) {
 	defer b.mu.Unlock()
 	
 	if userClients, ok := b.clients[userID]; ok {
-		delete(userClients, clientChan)
-		close(clientChan)
-		
-		if len(userClients) == 0 {
-			delete(b.clients, userID)
+		// Check if the channel exists before attempting to close
+		if _, exists := userClients[clientChan]; exists {
+			// Remove from map first to prevent double-close
+			delete(userClients, clientChan)
+			
+			// Safely close the channel only once
+			func() {
+				defer func() {
+					if recover() != nil {
+						// Channel was already closed
+					}
+				}()
+				close(clientChan)
+			}()
+			
+			if len(userClients) == 0 {
+				delete(b.clients, userID)
+			}
 		}
-		
-		log.Printf("📡 [SSE Broker] Unregistered client for user %s (remaining: %d)", 
-			userID, len(userClients))
 	}
+	
+	log.Printf("📡 [SSE Broker] Unregistered client for user %s", userID)
 }
 
 // Broadcast sends an event to all clients for a specific user
