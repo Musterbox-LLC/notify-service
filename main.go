@@ -102,7 +102,7 @@ func main() {
 	}))
 
 	// 1. User routes (via Gateway — secured)
-	gatewayUserRoutes := app.Group("/v1/notify/s", gatewayAuth())
+	gatewayUserRoutes := app.Group("/v2", gatewayAuth())
 	notifHandler := handler.GetNotificationHandler()
 	gatewayUserRoutes.Get("/user/:user_id", notifHandler.GetAll)
 	gatewayUserRoutes.Get("/user/:user_id/since", notifHandler.GetAllSince)
